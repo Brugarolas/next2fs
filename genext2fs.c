@@ -3783,7 +3783,7 @@ showhelp(void)
 	"  -e, --fill-value <value>          Fill unallocated blocks with value.\n"
 	"  -z, --allow-holes                 Allow files with holes.\n"
 	"  -f, --faketime                    Set filesystem timestamps to 0 (for testing).\n"
-	"  -q, --squash                      Same as \"-U -P\".\n"
+	"  -q, --squash <uid>                Same as \"-U -P\".\n"
 	"  -U, --squash-uids <uid>           Squash owners making all files be owned by <id>:<id>.\n"
 	"  -P, --squash-perms                Squash permissions on all files.\n"
 	"  -h, --help\n"
@@ -3866,8 +3866,8 @@ main(int argc, char **argv)
 	  { "fill-value",	required_argument,	NULL, 'e' },
 	  { "allow-holes",	no_argument,		NULL, 'z' },
 	  { "faketime",		no_argument,		NULL, 'f' },
-	  { "squash",		no_argument,		NULL, 'q' },
-	  { "squash-uids",	no_argument,		NULL, 'U' },
+	  { "squash",		required_argument,	NULL, 'q' },
+	  { "squash-uids",	required_argument,	NULL, 'U' },
 	  { "squash-perms",	no_argument,		NULL, 'P' },
 	  { "help",		no_argument,		NULL, 'h' },
 	  { "version",		no_argument,		NULL, 'V' },

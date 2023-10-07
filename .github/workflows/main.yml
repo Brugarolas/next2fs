@@ -16,7 +16,7 @@ jobs:
           path: genext2fs.deb
 
   release:
-    name: Release
+    name: Release machine emulator tarball
     needs: [native]
     runs-on: ubuntu-22.04
     if: startsWith(github.ref, 'refs/tags/v')
