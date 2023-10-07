@@ -59,6 +59,8 @@
  */
 #define _FILE_OFFSET_BITS 64
 
+#include<signal.h>
+
 #include <config.h>
 #include <stdio.h>
 
@@ -210,8 +212,6 @@ static uint32 blocksize = 1024;
 #define SUPERBLOCK_SIZE		1024
 
 #define BLOCKSIZE         blocksize
-#define BLOCKS_PER_GROUP  8192
-#define INODES_PER_GROUP  8192
 /* Percentage of blocks that are reserved.*/
 #define RESERVED_BLOCKS       5/100
 #define MAX_RESERVED_BLOCKS  25/100
@@ -503,14 +503,30 @@ SI_atof(const char *nptr)
 
 static uint64_t suffix(const char *s)
 {
-	switch (s[0]) {
-	case'k': return (s[1] == 'i')? 1 << 10 : (s[1] == '\0')?               1000 : 0;
-	case'M': return (s[1] == 'i')? 1 << 20 : (s[1] == '\0')?        1000 * 1000 : 0;
-	case'G': return (s[1] == 'i')? 1 << 30 : (s[1] == '\0')? 1000 * 1000 * 1000 : 0;
-	case'%': return UINT64_MAX;
-	case 0 : return 1;
-	default: return 0;
-	}
+	const uint64_t k = 1000;
+	struct {
+		const char *str;
+		uint64_t    val;
+	} suffixes[] = {
+		{"k",     k}, {"ki", 1 << 10},
+		{"M",   k*k}, {"Mi", 1 << 20},
+		{"G", k*k*k}, {"Gi", 1 << 30},
+		{"%", UINT64_MAX},
+		{"", 1},
+	};
+	for (int i=0; i<sizeof(suffixes) / sizeof(suffixes[0]); ++i)
+		if (strcmp(suffixes[i].str, s) == 0)
+			return suffixes[i].val;
+	return 0;
+}
+
+static int min_groups(uint32_t blocks, uint32_t inodes, uint32_t fdb)
+{
+	uint32_t bits_per_block = 8 * BLOCKSIZE,
+		 min_blocks = (blocks + bits_per_block) / bits_per_block,
+		 min_inodes = (inodes + bits_per_block) / bits_per_block;
+
+	return min_blocks > min_inodes? min_blocks : min_inodes;
 }
 
 /** compute the adjusted value of x considering the suffix(s)
@@ -538,6 +554,11 @@ uint64_t adjust(uint64_t x, char *const s)
 	if (m == 0) error_msg_and_die("invalid readjustment\n");
 	if (m == UINT64_MAX) return (inc * x) + x * v / 100; // +? <x> %
 	else                 return (inc * x) + m * v;       // +? <x> k,M,G,ki,Mi,Gi
+}
+
+uintptr_t align(uintptr_t p, size_t a)
+{
+	return (p + (a-1)) & ~(a-1);
 }
 
 // endianness swap
@@ -857,6 +878,13 @@ error_msg(const char *s, ...)
 	va_end(p);
 	putc('\n', stderr);
 }
+static void
+t_sys_break()
+{
+	fprintf(stderr, "gdb attach %d\n", getpid());
+	raise(SIGSTOP);
+}
+
 
 static void
 error_msg_and_die(const char *s, ...)
@@ -866,6 +894,8 @@ error_msg_and_die(const char *s, ...)
 	verror_msg(s, p);
 	va_end(p);
 	putc('\n', stderr);
+
+	//t_sys_break();
 	exit(EXIT_FAILURE);
 }
 
@@ -2372,8 +2402,8 @@ add2fs_from_tarball(filesystem *fs, uint32 this_nod, FILE * fh, int squash_uids,
 		major = OCTAL_READ(tarhead->major);
 		minor = OCTAL_READ(tarhead->minor);
 		type = tarhead->filetype;
-		if (squash_uids)
-			uid = gid = 0;
+		if (squash_uids != -1)
+			uid = gid = squash_uids;
 		if (squash_perms)
 			mode &= ~(FM_IRWXG | FM_IRWXO);
 		if(has_longname)
@@ -2535,6 +2565,8 @@ add2fs_from_tarball(filesystem *fs, uint32 this_nod, FILE * fh, int squash_uids,
 	char *path2, *path3, *dir, *name, *lnk;
 	size_t filesize;
 	uint32 uid, gid, mode, ctime, mtime;
+	uint32 dirbytes = 0, curdirbytes = 0;
+	const char *filepath;
 	a = archive_read_new();
 	if (a == NULL)
 		error_msg_and_die("Couldn't create archive reader.");
@@ -2564,18 +2596,34 @@ add2fs_from_tarball(filesystem *fs, uint32 this_nod, FILE * fh, int squash_uids,
 			{
 				case S_IFLNK:
 					if(filesize >= 4 * (EXT2_TIND_BLOCK+1))
-						stats->nblocks += (filesize + BLOCKSIZE - 1) / BLOCKSIZE;
+						stats->nblocks += align(filesize, BLOCKSIZE) / BLOCKSIZE;
 					stats->ninodes++;
 					break;
 				case S_IFREG:
 					stats->nblocks += ifreg_blocks(filesize, BLOCKSIZE >> 11);
+					stats->ninodes++;
+					break;
 				case S_IFCHR:
 				case S_IFBLK:
 				case S_IFIFO:
 				case S_IFSOCK:
+					stats->nblocks++;
 					stats->ninodes++;
 					break;
 				case S_IFDIR:
+					filepath = archive_entry_pathname(entry);
+					if (filepath == NULL) {
+						error_msg("invalid filename %s\n", filepath);
+						continue;
+					}
+					curdirbytes = align(strlen(filepath), 4);
+					if (dirbytes + curdirbytes > BLOCKSIZE) {
+						dirbytes = curdirbytes;
+						stats->nblocks++;
+					} else {
+						dirbytes += curdirbytes;
+					}
+					stats->nblocks++;
 					stats->ninodes++;
 					break;
 				default:
@@ -2594,8 +2642,8 @@ add2fs_from_tarball(filesystem *fs, uint32 this_nod, FILE * fh, int squash_uids,
 		}
 		uid = archive_entry_uid(entry);
 		gid = archive_entry_gid(entry);
-		if (squash_uids)
-			uid = gid = 0;
+		if (squash_uids != -1)
+			uid = gid = squash_uids;
 		if (squash_perms)
 			mode &= ~(FM_IRWXG | FM_IRWXO);
 		if(find_dir(fs, nod, name))
@@ -2654,6 +2702,8 @@ add2fs_from_tarball(filesystem *fs, uint32 this_nod, FILE * fh, int squash_uids,
 		free(path2);
 		free(path3);
 	}
+	if (stats && (dirbytes != 0))
+		stats->nblocks++;
 	archive_read_close(a);
 	archive_read_free(a);
 #endif
@@ -2847,8 +2897,8 @@ add2fs_from_dir(filesystem *fs, uint32 this_nod, int squash_uids, int squash_per
 		mtime = fs_timestamp? st.st_mtime : 0;
 		name = dent->d_name;
 		mode = get_mode(&st);
-		if(squash_uids)
-			uid = gid = 0;
+		if(squash_uids != -1)
+			uid = gid = squash_uids;
 		if(squash_perms)
 			mode &= ~(FM_IRWXG | FM_IRWXO);
 		if(stats)
@@ -2860,7 +2910,8 @@ add2fs_from_dir(filesystem *fs, uint32 this_nod, int squash_uids, int squash_per
 					stats->ninodes++;
 					break;
 				case S_IFREG:
-					stats->nblocks += ifreg_blocks((st.st_size + BLOCKSIZE - 1), BLOCKSIZE >> 11);
+          // stats->nblocks += ifreg_blocks((st.st_size + BLOCKSIZE - 1), BLOCKSIZE >> 11);
+					stats->nblocks += ifreg_blocks((st.st_size), BLOCKSIZE >> 11);
 				case S_IFCHR:
 				case S_IFBLK:
 				case S_IFIFO:
@@ -2868,13 +2919,16 @@ add2fs_from_dir(filesystem *fs, uint32 this_nod, int squash_uids, int squash_per
 					stats->ninodes++;
 					break;
 				case S_IFDIR:
-					curdirbytes = dent->d_reclen;
+					curdirbytes = align(dent->d_reclen, 4);
+
 					if (dirbytes + curdirbytes > BLOCKSIZE) {
 						dirbytes = curdirbytes;
 						stats->nblocks++;
 					} else {
 						dirbytes += curdirbytes;
 					}
+
+					stats->nblocks++;
 					stats->ninodes++;
 					if(chdir(dent->d_name) < 0)
 						perror_msg_and_die(dent->d_name);
@@ -3097,21 +3151,15 @@ init_fs(int nbblocks, int nbinodes, int nbresrvd, int holes,
 	if(nbblocks < 8)
 		error_msg_and_die("too few blocks. Note: options have changed, see --help or the man page.");
 
-	/* nbinodes is the total number of inodes in the system.
-	 * a block group can have no more than 8192 inodes.
-	 */
-	min_nbgroups = (nbinodes + INODES_PER_GROUP - 1) / INODES_PER_GROUP;
-
 	/* On filesystems with 1k block size, the bootloader area uses a full
 	 * block. For 2048 and up, the superblock can be fitted into block 0.
 	 */
 	first_block = (BLOCKSIZE == 1024);
 
 	/* nbblocks is the total number of blocks in the filesystem.
-	 * a block group can have no more than 8192 blocks.
+	 * a block group can have no more than 8 * BLOCKSIZE blocks.
 	 */
-	nbgroups = (nbblocks - first_block + BLOCKS_PER_GROUP - 1) / BLOCKS_PER_GROUP;
-	if(nbgroups < min_nbgroups) nbgroups = min_nbgroups;
+	nbgroups = min_groups(nbblocks, nbinodes, first_block);
 	nbblocks_per_group = rndup((nbblocks - first_block + nbgroups - 1)/nbgroups, 8);
 	nbinodes_per_group = rndup((nbinodes + nbgroups - 1)/nbgroups,
 						(BLOCKSIZE/sizeof(inode)));
@@ -3725,6 +3773,7 @@ showhelp(void)
 	"  -a, --tarball <file>[:path]       Copy from a tar archive into path (or root)\n"
 	"  -B, --block-size <bytes>\n"
 	"  -b, --size-in-blocks <blocks>\n"
+	"  -r, --readjustment <blocks>       Specify a number of blocks to be added on top of the automatic calculation\n"
 	"  -i, --bytes-per-inode <bytes per inode>\n"
 	"  -N, --number-of-inodes <number of inodes>\n"
 	"  -L, --volume-label <string>\n"
@@ -3735,7 +3784,7 @@ showhelp(void)
 	"  -z, --allow-holes                 Allow files with holes.\n"
 	"  -f, --faketime                    Set filesystem timestamps to 0 (for testing).\n"
 	"  -q, --squash                      Same as \"-U -P\".\n"
-	"  -U, --squash-uids                 Squash owners making all files be owned by root.\n"
+	"  -U, --squash-uids <uid>           Squash owners making all files be owned by <id>:<id>.\n"
 	"  -P, --squash-perms                Squash permissions on all files.\n"
 	"  -h, --help\n"
 	"  -V, --version\n"
@@ -3788,7 +3837,7 @@ main(int argc, char **argv)
 	int verbose = 0;
 	int holes = 0;
 	int emptyval = 0;
-	int squash_uids = 0;
+	int squash_uids = -1;
 	int squash_perms = 0;
 	uint16 endian = 1;
 	int bigendian = !*(char*)&endian;
@@ -3797,7 +3846,7 @@ main(int argc, char **argv)
 	int i;
 	int c;
 	struct stats stats;
-	char adjust_string[64] = "+1%";
+	char adjust_string[64] = "+0%"; // "+1%"
 
 #if HAVE_GETOPT_LONG
 	struct option longopts[] = {
@@ -3828,11 +3877,11 @@ main(int argc, char **argv)
 
 	app_name = argv[0];
 
-	while((c = getopt_long(argc, argv, "x:d:D:a:B:b:i:N:r:L:m:o:g:e:zfqUPhVv", longopts, NULL)) != EOF) {
+	while((c = getopt_long(argc, argv, "x:d:D:a:B:b:i:N:r:L:m:o:g:e:zfqU:PhVv", longopts, NULL)) != EOF) {
 #else
 	app_name = argv[0];
 
-	while((c = getopt(argc, argv,      "x:d:D:a:B:b:i:N:r:L:m:o:g:e:zfqUPhVv")) != EOF) {
+	while((c = getopt(argc, argv,      "x:d:D:a:B:b:i:N:r:L:m:o:g:e:zfqU:PhVv")) != EOF) {
 #endif /* HAVE_GETOPT_LONG */
 		switch(c)
 		{
@@ -3888,11 +3937,11 @@ main(int argc, char **argv)
 				fs_timestamp = 0;
 				break;
 			case 'q':
-				squash_uids = 1;
+				squash_uids = atoi(optarg);
 				squash_perms = 1;
 				break;
 			case 'U':
-				squash_uids = 1;
+				squash_uids = atoi(optarg);
 				break;
 			case 'P':
 				squash_perms = 1;
@@ -3957,14 +4006,20 @@ main(int argc, char **argv)
 		stats.nblocks = 0;
 
 		populate_fs(NULL, layers, nlayers, squash_uids, squash_perms, fs_timestamp, &stats);
-		groups = (stats.nblocks >> 13) > (stats.ninodes >> 13)?
-			 (stats.nblocks >> 13) : (stats.ninodes >> 13);
+
+		//groups = (stats.nblocks / (8 * BLOCKSIZE)) > (stats.ninodes / (8 * BLOCKSIZE))?
+		//	 (stats.nblocks / (8 * BLOCKSIZE)) : (stats.ninodes / (8 * BLOCKSIZE));
 		//printf("nblocks: %ld, ninodes: %ld, groups: %d | %Ld\n", stats.nblocks, stats.ninodes, groups, nbblocks);
+		groups = min_groups(stats.nblocks, stats.ninodes, BLOCKSIZE == 1024);
+		//printf("nblocks: %ld, ninodes: %ld, groups: %d | %Ld\n", stats.nblocks, stats.ninodes, groups, nbblocks);
+		uint32_t nbinodes_per_group = rndup((stats.ninodes + groups - 1)/groups, (BLOCKSIZE/sizeof(inode)));
+		uint32_t gdsz = rndup(groups * sizeof(groupdescriptor), BLOCKSIZE) / BLOCKSIZE,
+			 itsz = nbinodes_per_group * sizeof(inode) / BLOCKSIZE;
 		stats.nblocks +=
-		( 1 // superblocks
-		+ 2 // bitmaps
-		+ (groups * sizeof(groupdescriptor) + BLOCKSIZE - 1) / BLOCKSIZE // descriptor table
-		+ (groups * sizeof(inode) + BLOCKSIZE - 1) / BLOCKSIZE           // inodes per group
+		( 1    // superblocks
+		+ 2    // bitmaps
+		+ gdsz // descriptor table
+		+ itsz // inodes per group
 		) * groups;
 
 		if(nbinodes == -1)
