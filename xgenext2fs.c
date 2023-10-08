@@ -2703,6 +2703,7 @@ add2fs_from_dir(filesystem *fs, uint32 this_nod, int squash_uids, int squash_per
 					stats->ninodes++;
 					break;
 				case S_IFREG:
+          // stats->nblocks += ifreg_blocks((st.st_size + BLOCKSIZE - 1), BLOCKSIZE >> 11);
 					stats->nblocks += ifreg_blocks((st.st_size), BLOCKSIZE >> 11);
 				case S_IFCHR:
 				case S_IFBLK:
@@ -2711,6 +2712,15 @@ add2fs_from_dir(filesystem *fs, uint32 this_nod, int squash_uids, int squash_per
 					stats->ninodes++;
 					break;
 				case S_IFDIR:
+					curdirbytes = align(dent->d_reclen, 4);
+
+					if (dirbytes + curdirbytes > BLOCKSIZE) {
+						dirbytes = curdirbytes;
+						stats->nblocks++;
+					} else {
+						dirbytes += curdirbytes;
+					}
+
 					stats->nblocks++;
 					stats->ninodes++;
 					if(chdir(dent->d_name) < 0)
@@ -3630,7 +3640,7 @@ main(int argc, char **argv)
 	int i;
 	int c;
 	struct stats stats;
-	char adjust_string[64] = "+0%";
+	char adjust_string[64] = "+0%"; // "+1%"
 
 #if HAVE_GETOPT_LONG
 	struct option longopts[] = {
@@ -3786,6 +3796,7 @@ main(int argc, char **argv)
 		stats.nblocks = 0;
 
 		populate_fs(NULL, layers, nlayers, squash_uids, squash_perms, fs_timestamp, &stats);
+
 		//groups = (stats.nblocks / (8 * BLOCKSIZE)) > (stats.ninodes / (8 * BLOCKSIZE))?
 		//	 (stats.nblocks / (8 * BLOCKSIZE)) : (stats.ninodes / (8 * BLOCKSIZE));
 		//printf("nblocks: %ld, ninodes: %ld, groups: %d | %Ld\n", stats.nblocks, stats.ninodes, groups, nbblocks);
