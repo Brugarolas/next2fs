@@ -1,10 +1,11 @@
 /* vi: set sw=8 ts=8: */
-// genext2fs.c
+// xgenext2fs.c
 //
 // ext2 filesystem generator for embedded systems
 // Copyright (C) 2000 Xavier Bestel <xav@bes.tel>
+// Copyright (C) 2023 Marcelo Politzer <https://discord.com/channels/600597137524391947/1107945240360394853>
 //
-// Please direct support requests to https://github.com/bestouff/genext2fs/issues
+// Please direct support requests to https://github.com/cartesi/genext2fs/issues
 //
 // 'du' portions taken from coreutils/du.c in busybox:
 //	Copyright (C) 1999,2000 by Lineo, inc. and John Beppu
@@ -2344,220 +2345,6 @@ int is_zero(char *block, size_t size)
 static void
 add2fs_from_tarball(filesystem *fs, uint32 this_nod, FILE * fh, int squash_uids, int squash_perms, uint32 fs_timestamp, struct stats *stats)
 {
-#ifndef HAVE_LIBARCHIVE
-	uint32 nod, hlnod, oldnod;
-	uint32 uid, gid, mode, major, minor, ctime, mtime;
-	char buffer[TAR_BLOCKSIZE];
-	char pathbuf[TAR_FULLFILENAME], *path, *path2 = NULL, *dir, *name;
-	char type;
-	struct tar_header *tarhead = (void*)buffer;
-	size_t filesize, padding;
-	int nbnull = 0;
-	int i, checksum, signed_checksum, unsigned_checksum;
-	int has_longname = 0;
-	char *longname = NULL;
-	size_t longname_size = 0;
-	int has_longlink = 0;
-	char *longlink = NULL;
-	size_t longlink_size = 0;
-
-	size_t readbytes;
-	while(1)
-	{
-		if (path2) {
-			free(path2);
-			path2 = NULL;
-		}
-		readbytes = fread(buffer, 1, TAR_BLOCKSIZE, fh);
-		if (!readbytes)
-			break;
-		if (readbytes != TAR_BLOCKSIZE)
-			error_msg_and_die("tarball has wrong size");
-		if (is_zero(buffer, sizeof buffer))
-		{
-			if (nbnull++)
-				break;
-			continue;
-		} else
-			nbnull = 0;
-		if (*(long *)tarhead->ustar != *(long *)"ustar\00000" && strcmp(tarhead->ustar, "ustar  "))
-			error_msg_and_die("not a tarball");
-		signed_checksum = unsigned_checksum = 0;
-		checksum = OCTAL_READ(tarhead->checksum);
-		memset(tarhead->checksum, ' ', sizeof tarhead->checksum);
-		for(i = 0; i < TAR_BLOCKSIZE; i++)
-		{
-			signed_checksum += (signed char)buffer[i];
-			unsigned_checksum += (unsigned char)buffer[i];
-		}
-		if(checksum != signed_checksum && checksum != unsigned_checksum)
-			error_msg_and_die("tarball corrupted");
-		filesize = OCTAL_READ(tarhead->filesize);
-		padding = rndup(filesize, TAR_BLOCKSIZE) - filesize;
-		mtime = OCTAL_READ(tarhead->mtime);
-		ctime = fs_timestamp;
-		uid = OCTAL_READ(tarhead->uid);
-		gid = OCTAL_READ(tarhead->gid);
-		mode = OCTAL_READ(tarhead->filemode) & FM_IMASK;
-		major = OCTAL_READ(tarhead->major);
-		minor = OCTAL_READ(tarhead->minor);
-		type = tarhead->filetype;
-		if (squash_uids != -1)
-			uid = gid = squash_uids;
-		if (squash_perms)
-			mode &= ~(FM_IRWXG | FM_IRWXO);
-		if(has_longname)
-		{
-			path = longname;
-			has_longname = 0;
-		} else {
-			strncpy(pathbuf, tarhead->prefix, sizeof tarhead->prefix);
-			strncpy(pathbuf+strnlen(pathbuf, sizeof pathbuf), tarhead->filename, sizeof tarhead->filename);
-			pathbuf[strnlen(pathbuf, sizeof pathbuf - 1)] = '\0';
-			path = pathbuf;
-		}
-		if (stats)
-		{
-			switch (type)
-			{
-				case '2':
-					if (strlen(tarhead->linkedname) >= 4 * (EXT2_TIND_BLOCK+1))
-						stats->nblocks += (filesize + BLOCKSIZE - 1) / BLOCKSIZE;
-					stats->ninodes++;
-					break;
-				case '0':
-				case 0:
-				case '7':
-					stats->nblocks += ifreg_blocks(filesize, BLOCKSIZE >> 11);
-				case '1':
-				case '6':
-				case '3':
-				case '4':
-					stats->ninodes++;
-					break;
-				default:
-					break;
-			}
-			fseek(fh, filesize + padding, SEEK_CUR);
-		} else {
-			if (fs && strcmp(path, "/") == 0) {
-				// if the entry modifies the root node, don't call
-				// basename and dirname but chmod the root node
-				// directly
-				fseek(fh, filesize + padding, SEEK_CUR);
-				if (type != '5') {
-					error_msg("tarball entry \"%s\" skipped: root node must be a directory", path);
-					continue;
-				}
-				mode |= FM_IFDIR;
-				chmod_fs(fs, this_nod, mode, uid, gid);
-				continue;
-			}
-			path2 = strdup(path);
-			name = basename(path);
-			dir = dirname(path2);
-			if((!strcmp(name, ".")) || (!strcmp(name, "..")))
-			{
-				error_msg("tarball entry %s skipped", path);
-				fseek(fh, filesize + padding, SEEK_CUR);
-				continue;
-			}
-			if(fs)
-			{
-				if(!(nod = find_path(fs, this_nod, dir)))
-				{
-					error_msg("tarball entry %s skipped: can't find directory '%s' to create '%s''", path, dir, name);
-					fseek(fh, filesize + padding, SEEK_CUR);
-					continue;
-				}
-			}
-			else
-				nod = 0;
-			switch (type)
-			{
-				case '5':
-					if((oldnod = find_path(fs, nod, name)))
-						chmod_fs(fs, nod = oldnod, mode, uid, gid);
-					else
-						nod = mkdir_fs(fs, nod, name, mode, uid, gid, ctime, mtime);
-					fseek(fh, filesize + padding, SEEK_CUR);
-					break;
-				case '0':
-				case 0:
-				case '7':
-					nod = mkfile_fs(fs, nod, name, mode, fh_read, fh, filesize, uid, gid, ctime, mtime);
-					fseek(fh, padding, SEEK_CUR);
-					break;
-				case '1':
-					if(!(hlnod = find_path(fs, this_nod, tarhead->linkedname)))
-					{
-						error_msg("tarball entry %s skipped: can't find hardlink destination '%s' to create '%s''", path, dir, name);
-						fseek(fh, filesize + padding, SEEK_CUR);
-						continue;
-					}
-					add2dir(fs, nod, hlnod, name);
-					fseek(fh, filesize + padding, SEEK_CUR);
-					break;
-				case '2':
-					if(has_longlink)
-						mklink_fs(fs, nod, name, strlen(longlink), (uint8*)longlink, uid, gid, ctime, mtime);
-					else
-						mklink_fs(fs, nod, name, strlen(tarhead->linkedname), (uint8*)tarhead->linkedname, uid, gid, ctime, mtime);
-					has_longlink = 0;
-					fseek(fh, filesize + padding, SEEK_CUR);
-					break;
-				case '6':
-					nod = mknod_fs(fs, nod, name, mode|FM_IFIFO, uid, gid, 0, 0, ctime, mtime);
-					fseek(fh, filesize + padding, SEEK_CUR);
-					break;
-				case '3':
-					nod = mknod_fs(fs, nod, name, mode|FM_IFCHR, uid, gid, major, minor, ctime, mtime);
-					fseek(fh, filesize + padding, SEEK_CUR);
-					break;
-				case '4':
-					nod = mknod_fs(fs, nod, name, mode|FM_IFBLK, uid, gid, major, minor, ctime, mtime);
-					fseek(fh, filesize + padding, SEEK_CUR);
-					break;
-				case 'L':
-					if(has_longname)
-						error_msg("tarball longname to '%s' hasn't been consumed", longname);
-					if(filesize + padding > longname_size)
-					{
-						if(longname)
-							free(longname);
-						longname = malloc(longname_size = filesize + padding);
-					}
-					fread(longname, longname_size, 1, fh);
-					has_longname = 1;
-					break;
-				case 'K':
-					if(has_longlink)
-						error_msg("tarball longlink to '%s' hasn't been consumed", longlink);
-					if(filesize + padding > longlink_size)
-					{
-						if(longlink)
-							free(longlink);
-						longlink = malloc(longlink_size = filesize + padding);
-					}
-					fread(longlink, longlink_size, 1, fh);
-					has_longlink = 1;
-					break;
-				default:
-					error_msg("tarball entry %s skipped: bad type '%c' for entry '%s'", path, type, name);
-					fseek(fh, filesize + padding, SEEK_CUR);
-					continue;
-			}
-		}
-	}
-	if (path2)
-		free(path2);
-	if (nbnull != 2)
-		error_msg_and_die("tarball has wrong size");
-	if(longname)
-		free(longname);
-	if(longlink)
-		free(longlink);
-#else
 	int r;
 	uint32 nod, lnknod;
 	struct archive *a;
@@ -2588,6 +2375,18 @@ add2fs_from_tarball(filesystem *fs, uint32 this_nod, FILE * fh, int squash_uids,
 		mode = archive_entry_mode(entry);
 		if (stats)
 		{
+			filepath = archive_entry_pathname(entry);
+			if (filepath == NULL) {
+				error_msg("invalid filename %s\n", filepath);
+				continue;
+			}
+			curdirbytes = align(sizeof(directory) + strlen(filepath), 4);
+			if (dirbytes + curdirbytes > BLOCKSIZE) {
+				dirbytes = curdirbytes;
+				stats->nblocks++;
+			} else {
+				dirbytes += curdirbytes;
+			}
 			// depending on the archive, the entry size might not
 			// be set in the first place in which case the
 			// estimate might be totally off
@@ -2611,18 +2410,6 @@ add2fs_from_tarball(filesystem *fs, uint32 this_nod, FILE * fh, int squash_uids,
 					stats->ninodes++;
 					break;
 				case S_IFDIR:
-					filepath = archive_entry_pathname(entry);
-					if (filepath == NULL) {
-						error_msg("invalid filename %s\n", filepath);
-						continue;
-					}
-					curdirbytes = align(strlen(filepath), 4);
-					if (dirbytes + curdirbytes > BLOCKSIZE) {
-						dirbytes = curdirbytes;
-						stats->nblocks++;
-					} else {
-						dirbytes += curdirbytes;
-					}
 					stats->nblocks++;
 					stats->ninodes++;
 					break;
@@ -2706,7 +2493,6 @@ add2fs_from_tarball(filesystem *fs, uint32 this_nod, FILE * fh, int squash_uids,
 		stats->nblocks++;
 	archive_read_close(a);
 	archive_read_free(a);
-#endif
 }
 
 // add or fixup entries to the filesystem from a text file
@@ -2901,7 +2687,14 @@ add2fs_from_dir(filesystem *fs, uint32 this_nod, int squash_uids, int squash_per
 			uid = gid = squash_uids;
 		if(squash_perms)
 			mode &= ~(FM_IRWXG | FM_IRWXO);
-		if(stats)
+		if(stats) {
+			curdirbytes = align(sizeof(directory) + strlen(dent->d_name), 4);
+			if (dirbytes + curdirbytes > BLOCKSIZE) {
+				dirbytes = curdirbytes;
+				stats->nblocks++;
+			} else {
+				dirbytes += curdirbytes;
+			}
 			switch(st.st_mode & S_IFMT)
 			{
 				case S_IFLNK:
@@ -2940,6 +2733,7 @@ add2fs_from_dir(filesystem *fs, uint32 this_nod, int squash_uids, int squash_per
 				default:
 					break;
 			}
+		}
 		else
 		{
 			if((nod = find_dir(fs, this_nod, name)))
@@ -3759,7 +3553,7 @@ populate_fs(filesystem *fs, struct fslayer *fslayers, int nlayers, int squash_ui
 static void
 showversion(void)
 {
-	printf("genext2fs " VERSION "\n");
+	printf("xgenext2fs " VERSION "\n");
 }
 
 static void
@@ -3789,7 +3583,7 @@ showhelp(void)
 	"  -h, --help\n"
 	"  -V, --version\n"
 	"  -v, --verbose\n\n"
-	"Report bugs to https://github.com/bestouff/genext2fs/issues\n", app_name);
+	"Report bugs to https://github.com/cartesi/genext2fs/issues\n", app_name);
 }
 
 #define MAX_DOPT 128
@@ -3997,10 +3791,6 @@ main(int argc, char **argv)
 	else
 	{
 		int groups;
-		if(reserved_frac == -1)
-			nbresrvd = nbblocks * RESERVED_BLOCKS;
-		else 
-			nbresrvd = nbblocks * reserved_frac;
 
 		stats.ninodes = EXT2_FIRST_INO - 1 + (nbresrvd ? 1 : 0);
 		stats.nblocks = 0;
@@ -4021,6 +3811,13 @@ main(int argc, char **argv)
 		+ gdsz // descriptor table
 		+ itsz // inodes per group
 		) * groups;
+
+		// reserved blocks
+		if(reserved_frac == -1)
+			nbresrvd = stats.nblocks * RESERVED_BLOCKS;
+		else
+			nbresrvd = stats.nblocks * reserved_frac;
+		stats.nblocks += nbresrvd;
 
 		if(nbinodes == -1)
 			nbinodes = adjust(stats.ninodes, adjust_string);
